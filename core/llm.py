@@ -11,7 +11,7 @@ def get_llm(temp=0.1, tokens=3000):
     location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
 
     return ChatVertexAI(
-        model_name="gemini-2.0-flash",
+        model_name="gemini-2.5-flash",
         project=project,
         location=location,
         temperature=temp,

@@ -1,4 +1,6 @@
 import json
+import os
+import re
 from pathlib import Path
 from typing import Dict
 
@@ -12,23 +14,29 @@ from langchain_core.messages import SystemMessage, HumanMessage
 LLM = get_llm()
 
 # =========================================================
-# SYSTEM PROMPT (STRICT CONTRACT)
+# SYSTEM PROMPT (HARD CONTRACT)
 # =========================================================
 SYSTEM_PROMPT = """
 You are a senior Terraform engineer for GCP.
 
-You MUST return a VALID JSON OBJECT.
-DO NOT include markdown, comments, or explanations.
+Return ONLY a valid JSON object.
+NO markdown. NO backticks. NO explanations.
 
-STRICT RULES (DO NOT VIOLATE):
-- DO NOT define terraform {} blocks
-- DO NOT define provider blocks
-- DO NOT define variables named "project_id" or "region"
-- DO NOT reference var.project_id or var.region
-- Each resource must be inside a Terraform module
-- Each module MUST contain: main.tf, variables.tf, outputs.tf
+HARD RULES (VIOLATION = BUG):
+- DO NOT include terraform {} blocks
+- DO NOT include provider blocks
+- DO NOT define variables named project_id or region
+- DO NOT reference project_id or region anywhere
+- DO NOT pass project_id or region to modules
+- Modules must NEVER contain provider logic
+- Every resource MUST be inside a module
+- Each module MUST contain main.tf, variables.tf, outputs.tf
 
-Required JSON format:
+STACK RULES:
+- Stack main.tf may ONLY wire modules together
+- Stack main.tf must NOT contain project_id arguments
+
+JSON FORMAT:
 
 {
   "modules": [
@@ -49,45 +57,79 @@ Required JSON format:
 """
 
 # =========================================================
-# SAFE JSON PARSER
+# PROJECT / REGION (STACK-ONLY)
 # =========================================================
-def _safe_json_load(text: str) -> Dict:
-    if not text or not text.strip():
-        raise ValueError("LLM returned empty response")
+def resolve_project_and_region(user_request: str):
+    proj = re.search(r"project id\s+([a-z0-9\-]+)", user_request, re.I)
+    reg = re.search(r"region\s+([a-z0-9\-]+)", user_request, re.I)
 
-    text = text.strip()
+    project_id = proj.group(1) if proj else os.environ.get("GOOGLE_CLOUD_PROJECT")
+    region = reg.group(1) if reg else os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
 
-    if text.startswith("```"):
-        text = text.replace("```json", "").replace("```", "").strip()
+    if not project_id:
+        raise RuntimeError(
+            "Project ID not found. Provide it in request or set GOOGLE_CLOUD_PROJECT."
+        )
 
-    return json.loads(text)
+    return project_id, region
 
 # =========================================================
-# SANITIZERS
+# JSON LOADER (BULLETPROOF)
 # =========================================================
-def _sanitize_hcl(lines):
+def safe_json_load(raw: str) -> Dict:
+    if not raw:
+        raise RuntimeError("LLM returned empty output")
+
+    for fence in ("```json", "```terraform", "```"):
+        raw = raw.replace(fence, "")
+
+    raw = raw.strip()
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+
+    if start == -1 or end == -1:
+        raise RuntimeError(f"No JSON object found:\n{raw}")
+
+    try:
+        return json.loads(raw[start : end + 1])
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Invalid JSON returned by LLM:\n{raw}") from e
+
+# =========================================================
+# SANITIZERS (CRITICAL)
+# =========================================================
+FORBIDDEN_TOKENS = (
+    "project_id",
+    "var.project_id",
+    "region",
+    "var.region",
+)
+
+def sanitize_module_hcl(hcl: str) -> str:
     """
-    Removes terraform blocks, provider blocks,
-    and forbidden global variables.
+    Removes provider blocks, terraform blocks,
+    and ANY reference to project_id / region.
     """
+    lines = hcl.splitlines()
     cleaned = []
     skip = False
 
     for line in lines:
-        stripped = line.strip()
+        s = line.strip()
 
         # Remove terraform/provider blocks
-        if stripped.startswith("terraform") or stripped.startswith("provider "):
+        if s.startswith("terraform") or s.startswith("provider "):
             skip = True
             continue
 
         if skip:
-            if stripped == "}":
+            if s == "}":
                 skip = False
             continue
 
-        # Remove forbidden globals
-        if "project_id" in stripped or "region" in stripped:
+        # Drop forbidden tokens completely
+        if any(tok in s for tok in FORBIDDEN_TOKENS):
             continue
 
         cleaned.append(line)
@@ -95,57 +137,19 @@ def _sanitize_hcl(lines):
     return "\n".join(cleaned).strip()
 
 
-def _sanitize_variables_tf(lines):
+def sanitize_stack_main_tf(hcl: str) -> str:
     """
-    Removes forbidden variables from variables.tf
+    Ensures stack main.tf NEVER passes project_id / region to modules.
     """
+    lines = hcl.splitlines()
     cleaned = []
-    skip = False
 
     for line in lines:
-        stripped = line.strip()
-
-        if stripped.startswith('variable "project_id"') or stripped.startswith('variable "region"'):
-            skip = True
+        if any(tok in line for tok in FORBIDDEN_TOKENS):
             continue
-
-        if skip:
-            if stripped == "}":
-                skip = False
-            continue
-
         cleaned.append(line)
 
     return "\n".join(cleaned).strip()
-
-
-def fix_multiline_hcl(content: str) -> str:
-    """
-    Converts unsafe multi-line values (SSH keys, scripts, certs)
-    into Terraform heredoc syntax.
-    """
-    if not content:
-        return content
-
-    # SSH public keys
-    if "ssh-rsa" in content or "ssh-ed25519" in content:
-        if 'ssh_keys = "' in content:
-            content = content.replace(
-                'ssh_keys = "',
-                'ssh_keys = <<EOT\n'
-            )
-            content = content.replace('"', '\nEOT', 1)
-
-    # Startup scripts / cloud-init
-    if "#!/bin/bash" in content or "startup_script" in content:
-        if 'startup_script = "' in content:
-            content = content.replace(
-                'startup_script = "',
-                'startup_script = <<EOT\n'
-            )
-            content = content.replace('"', '\nEOT', 1)
-
-    return content
 
 # =========================================================
 # MAIN ENTRY
@@ -158,26 +162,34 @@ def generate_terraform(user_request: str, stack_name: str = "gcp_stack"):
     modules_dir.mkdir(parents=True, exist_ok=True)
 
     # -----------------------------------------------------
-    # SYSTEM-OWNED VARIABLES
+    # PROJECT / REGION → STACK ONLY
+    # -----------------------------------------------------
+    project_id, region = resolve_project_and_region(user_request)
+
+    (stack_dir / "terraform.tfvars").write_text(
+        f'project_id = "{project_id}"\nregion = "{region}"\n',
+        encoding="utf-8",
+    )
+
+    # -----------------------------------------------------
+    # STACK VARIABLES (SYSTEM OWNED)
     # -----------------------------------------------------
     (stack_dir / "variables.tf").write_text(
         """
 variable "project_id" {
-  description = "GCP Project ID"
-  type        = string
+  type = string
 }
 
 variable "region" {
-  description = "GCP region"
-  type        = string
-  default     = "us-central1"
+  type    = string
+  default = "us-central1"
 }
 """.strip(),
         encoding="utf-8",
     )
 
     # -----------------------------------------------------
-    # SYSTEM-OWNED PROVIDER
+    # PROVIDER (STACK ONLY)
     # -----------------------------------------------------
     (stack_dir / "providers.tf").write_text(
         """
@@ -201,56 +213,39 @@ provider "google" {
     )
 
     # -----------------------------------------------------
-    # LLM CALL (JSON-ONLY)
+    # LLM CALL
     # -----------------------------------------------------
     llm_json = LLM.bind(response_format={"type": "json_object"})
-
-    resp = llm_json.invoke([
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=user_request),
-    ])
+    resp = llm_json.invoke(
+        [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=user_request),
+        ]
+    )
 
     raw = getattr(resp, "content", "")
-
     print("\n====== RAW LLM OUTPUT ======")
     print(raw)
-    print("====== END RAW OUTPUT ======\n")
+    print("====== END RAW LLM OUTPUT ======\n")
 
-    data = _safe_json_load(raw)
+    data = safe_json_load(raw)
 
     # -----------------------------------------------------
-    # WRITE MODULES (FULL SANITIZATION)
+    # WRITE MODULES (STRICTLY CLEAN)
     # -----------------------------------------------------
     for mod in data.get("modules", []):
         mod_dir = modules_dir / mod["name"]
         mod_dir.mkdir(parents=True, exist_ok=True)
 
         for fname, content in mod["files"].items():
-            lines = content.splitlines()
-
-            if fname == "main.tf":
-                content = _sanitize_hcl(lines)
-                content = fix_multiline_hcl(content)
-
-            elif fname == "variables.tf":
-                content = _sanitize_variables_tf(lines)
-
-            elif fname == "outputs.tf":
-                content = content.strip()
-
+            content = sanitize_module_hcl(content)
             (mod_dir / fname).write_text(content, encoding="utf-8")
 
     # -----------------------------------------------------
-    # WRITE STACK FILES
+    # WRITE STACK FILES (STRICT)
     # -----------------------------------------------------
     for fname, content in data.get("stack", {}).items():
-        if fname == "variables.tf":
-            continue  # system owns this
-
-        lines = content.splitlines()
-        content = _sanitize_hcl(lines)
-        content = fix_multiline_hcl(content)
-
+        content = sanitize_stack_main_tf(content)
         (stack_dir / fname).write_text(content, encoding="utf-8")
 
-    print(f"✅ Terraform generated successfully at: {stack_dir}")
+    print(f"Terraform stack generated successfully at: {stack_dir}")

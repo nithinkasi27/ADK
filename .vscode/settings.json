@@ -1,0 +1,10 @@
+// {
+//     "ansible.python.interpreterPath": "c:\\Users\\kbhanukr\\AppData\\Local\\Microsoft\\WindowsApps\\python3.12.exe"
+// }
+
+{
+  "python.analysis.typeCheckingMode": "basic",
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportMissingImports": "none"
+  }
+}
